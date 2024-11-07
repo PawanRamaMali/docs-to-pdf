@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  doc-converter:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - WINEDEBUG=-all
+      - WINEPREFIX=/opt/wineprefix
+    volumes:
+      - ./app:/opt/wineprefix/drive_c/app
+    restart: unless-stopped
