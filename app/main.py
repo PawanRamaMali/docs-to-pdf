@@ -1,13 +1,16 @@
+# app/main.py
 import os
 import logging
-from fastapi import FastAPI, UploadFile, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 import uuid
-import subprocess
 from app.converter import DocumentConverter
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Document to PDF Converter")
@@ -22,71 +25,22 @@ ALLOWED_EXTENSIONS = {'.docx', '.doc', '.rtf'}
 # Ensure upload directory exists
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@app.get("/test-environment")
-async def test_environment():
-    """Test Wine and Office environment"""
+def cleanup_files(input_path: str, output_path: str):
+    """Background task to cleanup temporary files after response is sent."""
     try:
-        # Test Wine
-        wine_ver = subprocess.run(
-            ['wine', '--version'], 
-            capture_output=True, 
-            text=True
-        )
-        
-        # Test Python in Wine
-        wine_python = subprocess.run(
-            ['wine', 'python', '--version'],
-            capture_output=True,
-            text=True
-        )
-        
-        # Test for Office components
-        test_script = '''
-import win32com.client
-word = win32com.client.Dispatch("Word.Application")
-word.Quit()
-'''
-        with open('/tmp/test.py', 'w') as f:
-            f.write(test_script)
+        if input_path and os.path.exists(input_path):
+            os.remove(input_path)
+            logger.info(f"Cleaned up input file: {input_path}")
             
-        office_test = subprocess.run(
-            ['wine', 'python', '/tmp/test.py'],
-            capture_output=True,
-            text=True
-        )
-        
-        return JSONResponse({
-            "wine_version": wine_ver.stdout if wine_ver.returncode == 0 else "Failed",
-            "wine_python": wine_python.stdout if wine_python.returncode == 0 else "Failed",
-            "office_test": "Success" if office_test.returncode == 0 else f"Failed: {office_test.stderr}"
-        })
-        
+        if output_path and os.path.exists(output_path):
+            os.remove(output_path)
+            logger.info(f"Cleaned up output file: {output_path}")
+            
     except Exception as e:
-        return JSONResponse({
-            "error": str(e)
-        }, status_code=500)
+        logger.error(f"Error during cleanup: {str(e)}")
 
-@app.get("/detailed-test")
-async def detailed_test():
-    """Run detailed environment test"""
-    try:
-        result = subprocess.run(
-            ['wine', 'python', '/opt/wineprefix/drive_c/app/test_env.py'],
-            capture_output=True,
-            text=True
-        )
-        return JSONResponse({
-            "output": result.stdout,
-            "errors": result.stderr,
-            "return_code": result.returncode
-        })
-    except Exception as e:
-        return JSONResponse({
-            "error": str(e)
-        }, status_code=500)
-        
 @app.post("/convert/")
-async def convert_document(file: UploadFile):
+async def convert_document(file: UploadFile, background_tasks: BackgroundTasks):
     """Convert uploaded document to PDF"""
     # Validate file extension
     file_ext = os.path.splitext(file.filename)[1].lower()
@@ -101,20 +55,31 @@ async def convert_document(file: UploadFile):
     input_path = os.path.join(UPLOAD_DIR, f"{unique_id}{file_ext}")
     output_path = os.path.join(UPLOAD_DIR, f"{unique_id}.pdf")
     
+    logger.info(f"Processing file: {file.filename}")
+    logger.info(f"Input path: {input_path}")
+    logger.info(f"Output path: {output_path}")
+    
     try:
         # Save uploaded file
         with open(input_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
+            
+        logger.info(f"Saved input file, size: {os.path.getsize(input_path)} bytes")
         
         # Convert to PDF
         result = converter.convert_to_pdf(input_path, output_path)
         
-        if not result:
+        if not result or not os.path.exists(output_path):
+            if os.path.exists(input_path):
+                os.remove(input_path)
             raise HTTPException(
                 status_code=500,
                 detail="Conversion failed"
             )
+        
+        # Schedule cleanup to run after response is sent
+        background_tasks.add_task(cleanup_files, input_path, output_path)
         
         # Return the PDF file
         return FileResponse(
@@ -124,20 +89,16 @@ async def convert_document(file: UploadFile):
         )
         
     except Exception as e:
-        logger.error(f"Error during conversion: {str(e)}")
+        logger.error(f"Error during conversion: {str(e)}", exc_info=True)
+        # Clean up in case of error
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        if os.path.exists(output_path):
+            os.remove(output_path)
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
-        
-    finally:
-        # Cleanup temporary files
-        for path in [input_path, output_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as e:
-                    logger.error(f"Error cleaning up file {path}: {str(e)}")
 
 @app.get("/health")
 async def health_check():
